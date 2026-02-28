@@ -13,13 +13,21 @@ DATASET_CONFIGS = {
         "path": "data/tissue_bc/GSE270497_All.txt",
         "feature_col": "smallRNAName",
         "drop_columns": ["smallRNApreName", "smallRNASequence"],
+        "data_mode": "count",
     },
     "circulating": {
         "path": "data/circulating_bc/GSE197020.txt",
         "feature_col": "smallRNASequence",
         "drop_columns": [],
+        "data_mode": "count",
     },
 }
+
+PANCANCER_MATRIX_PATH = "data/serum_pancancer/GSE211692_processed_data_matrix.txt"
+PANCANCER_METADATA_PATH = "data/serum_pancancer/GSE211692_metadata.csv"
+PANCANCER_FEATURE_COL = "ID_REF"
+PANCANCER_SAMPLE_ID_COL = "Title"
+PANCANCER_DISEASE_COL = "Disease State"
 
 # Labels derived from GEO GSE197020 metadata (disease state: breast cancer/normal).
 CIRCULATING_CANCER_SAMPLES = {
@@ -74,6 +82,193 @@ def _normalize_feature_name(feature_name):
     return str(feature_name).strip().lower()
 
 
+def _resolve_path(path_like):
+    path = Path(path_like)
+    if path.is_absolute():
+        return path
+    candidate = Path.cwd() / path
+    if candidate.exists():
+        return candidate
+    return path
+
+
+def _normalize_disease_name(disease_name):
+    return str(disease_name).strip().lower()
+
+
+def infer_data_mode_from_values(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_mask = np.isfinite(values)
+    if not finite_mask.all():
+        return "unknown"
+
+    if np.any(values < 0):
+        return "normalized"
+
+    rounded = np.round(values)
+    integer_like_ratio = np.isclose(values, rounded, atol=1e-6).mean()
+    if integer_like_ratio > 0.95:
+        return "count"
+    return "normalized"
+
+
+def summarize_expression_matrix(counts_df, data_mode):
+    values = counts_df.to_numpy(dtype=np.float64, copy=False)
+    finite_mask = np.isfinite(values)
+    has_negative = bool((values < 0).any())
+
+    if data_mode not in {"count", "normalized"}:
+        raise ValueError("data_mode must be 'count' or 'normalized'")
+
+    info = {
+        "data_mode": data_mode,
+        "inferred_data_mode": infer_data_mode_from_values(values),
+        "has_negative_values": has_negative,
+        "is_finite": bool(finite_mask.all()),
+        "n_samples": int(counts_df.shape[0]),
+        "n_features": int(counts_df.shape[1]),
+    }
+    return info
+
+
+def add_serum_pancancer_stage_labels(metadata_df, disease_col=PANCANCER_DISEASE_COL):
+    if disease_col not in metadata_df.columns:
+        raise ValueError(
+            f"Expected disease column '{disease_col}' in metadata. "
+            f"Available columns: {metadata_df.columns.tolist()}"
+        )
+
+    metadata_out = metadata_df.copy()
+    disease_norm = metadata_out[disease_col].astype(str).map(_normalize_disease_name)
+
+    benign_mask = disease_norm.str.contains("benign", regex=False)
+    control_mask = disease_norm.eq("no cancer")
+    non_cancer_mask = benign_mask | control_mask
+
+    metadata_out["disease_state_normalized"] = disease_norm
+    metadata_out["stage1_label"] = (~non_cancer_mask).astype(np.float32)
+    metadata_out["stage1_group"] = np.where(
+        control_mask,
+        "no_cancer_control",
+        np.where(benign_mask, "non_cancer_condition", "cancer"),
+    )
+
+    cancer_states = sorted(disease_norm[~non_cancer_mask].unique().tolist())
+    stage2_class_to_index = {class_name: idx for idx, class_name in enumerate(cancer_states)}
+    metadata_out["stage2_class_name"] = np.where(
+        ~non_cancer_mask,
+        disease_norm,
+        "non_cancer",
+    )
+    metadata_out["stage2_label"] = (
+        metadata_out["stage2_class_name"].map(stage2_class_to_index).fillna(-1).astype(int)
+    )
+
+    return metadata_out, stage2_class_to_index
+
+
+def load_serum_pancancer_dataset(
+    matrix_path=PANCANCER_MATRIX_PATH,
+    metadata_path=PANCANCER_METADATA_PATH,
+    feature_col=PANCANCER_FEATURE_COL,
+    sample_id_col=PANCANCER_SAMPLE_ID_COL,
+    disease_col=PANCANCER_DISEASE_COL,
+    normalize_feature_names=True,
+    data_mode="normalized",
+    return_info=False,
+):
+    matrix_path = _resolve_path(matrix_path)
+    metadata_path = _resolve_path(metadata_path)
+
+    metadata_df = pd.read_csv(metadata_path)
+    required_metadata_cols = {sample_id_col, disease_col}
+    missing_metadata_cols = required_metadata_cols.difference(metadata_df.columns)
+    if missing_metadata_cols:
+        raise ValueError(
+            f"Missing required metadata columns: {sorted(missing_metadata_cols)}. "
+            f"Available columns: {metadata_df.columns.tolist()}"
+        )
+
+    metadata_df = metadata_df.copy()
+    metadata_df[sample_id_col] = metadata_df[sample_id_col].astype(str)
+    if metadata_df[sample_id_col].duplicated().any():
+        dup_ids = metadata_df.loc[metadata_df[sample_id_col].duplicated(), sample_id_col].head(5).tolist()
+        raise ValueError(
+            f"Duplicated sample IDs found in metadata column '{sample_id_col}'. "
+            f"Examples: {dup_ids}"
+        )
+
+    matrix_df = pd.read_csv(matrix_path, sep="\t")
+    if feature_col not in matrix_df.columns:
+        raise ValueError(
+            f"Expected feature column '{feature_col}' in expression matrix. "
+            f"Available columns (first 10): {matrix_df.columns.tolist()[:10]}"
+        )
+
+    expr_df = matrix_df.set_index(feature_col)
+    expr_df = expr_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    if normalize_feature_names:
+        expr_df.index = expr_df.index.map(_normalize_feature_name)
+        expr_df = expr_df.groupby(level=0).mean()
+
+    counts_df = expr_df.T
+    counts_df.index = counts_df.index.astype(str)
+    counts_df.columns = counts_df.columns.astype(str)
+
+    keep_mask = metadata_df[sample_id_col].isin(counts_df.index)
+    metadata_aligned = metadata_df.loc[keep_mask].set_index(sample_id_col)
+    if metadata_aligned.empty:
+        raise ValueError(
+            "No overlapping samples between metadata and expression matrix. "
+            f"Metadata sample col='{sample_id_col}'."
+        )
+
+    counts_aligned = counts_df.loc[metadata_aligned.index]
+    metadata_labeled, stage2_class_to_index = add_serum_pancancer_stage_labels(
+        metadata_aligned.reset_index(),
+        disease_col=disease_col,
+    )
+    metadata_labeled = metadata_labeled.set_index(sample_id_col)
+
+    if not counts_aligned.index.equals(metadata_labeled.index):
+        raise ValueError("Aligned counts and metadata indexes are not identical in order.")
+
+    index_to_class = {idx: class_name for class_name, idx in stage2_class_to_index.items()}
+    label_maps = {
+        "stage2_class_to_index": stage2_class_to_index,
+        "stage2_index_to_class": index_to_class,
+    }
+
+    dataset_info = summarize_expression_matrix(counts_aligned, data_mode=data_mode)
+
+    if return_info:
+        return counts_aligned, metadata_labeled, label_maps, dataset_info
+    return counts_aligned, metadata_labeled, label_maps
+
+
+def load_serum_pancancer_stage1_binary(
+    matrix_path=PANCANCER_MATRIX_PATH,
+    metadata_path=PANCANCER_METADATA_PATH,
+    data_mode="normalized",
+    return_info=False,
+):
+    loader_output = load_serum_pancancer_dataset(
+        matrix_path=matrix_path,
+        metadata_path=metadata_path,
+        data_mode=data_mode,
+        return_info=return_info,
+    )
+    if return_info:
+        counts_df, metadata_df, label_maps, dataset_info = loader_output
+    else:
+        counts_df, metadata_df, label_maps = loader_output
+    labels = metadata_df["stage1_label"].to_numpy(dtype=np.float32)
+    if return_info:
+        return counts_df, labels, metadata_df, label_maps, dataset_info
+    return counts_df, labels, metadata_df, label_maps
+
+
 def infer_binary_labels(sample_names, dataset_name):
     sample_names = [str(sample).strip() for sample in sample_names]
 
@@ -102,7 +297,7 @@ def infer_binary_labels(sample_names, dataset_name):
     )
 
 
-def load_expression_dataset(dataset_name, data_path=None):
+def load_expression_dataset(dataset_name, data_path=None, data_mode=None, return_info=False):
     if dataset_name not in DATASET_CONFIGS:
         raise ValueError(
             f"Unknown dataset_name='{dataset_name}'. "
@@ -135,7 +330,12 @@ def load_expression_dataset(dataset_name, data_path=None):
     counts_df.columns = counts_df.columns.astype(str)
 
     labels = infer_binary_labels(counts_df.index.tolist(), dataset_name)
+    if data_mode is None:
+        data_mode = config.get("data_mode", "count")
+    dataset_info = summarize_expression_matrix(counts_df, data_mode=data_mode)
 
+    if return_info:
+        return counts_df, labels, dataset_info
     return counts_df, labels
 
 
@@ -228,14 +428,22 @@ def get_reference_features(counts_df, n_features=100):
 
 
 class ZINBDataset(Dataset):
-    def __init__(self, counts_df, labels, signal_features, ref_features):
-        labels = np.asarray(labels, dtype=np.float32).reshape(-1)
+    def __init__(self, counts_df, labels, signal_features, ref_features, task_type="binary"):
+        labels = np.asarray(labels).reshape(-1)
         if len(labels) != len(counts_df):
             raise ValueError(
                 f"Label length ({len(labels)}) must match sample count ({len(counts_df)})"
             )
 
-        self.labels = torch.FloatTensor(labels).unsqueeze(1)
+        self.task_type = str(task_type).strip().lower()
+        if self.task_type == "binary":
+            labels = labels.astype(np.float32)
+            self.labels = torch.FloatTensor(labels).unsqueeze(1)
+        elif self.task_type == "multiclass":
+            labels = labels.astype(np.int64)
+            self.labels = torch.LongTensor(labels)
+        else:
+            raise ValueError("task_type must be 'binary' or 'multiclass'")
 
         aligned_signal = align_feature_space(counts_df, signal_features)
         aligned_reference = align_feature_space(counts_df, ref_features)
