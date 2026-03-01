@@ -249,6 +249,8 @@ def train_orion(
     lr=1e-3,
     device="cuda",
     recon_mode="zinb",
+    class_weights=None,
+    pos_weight=None,
 ):
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -258,6 +260,8 @@ def train_orion(
         n_classes=getattr(model, "n_classes", 1),
         task_type=getattr(model, "task_type", None),
         recon_mode=recon_mode,
+        class_weights=class_weights,
+        pos_weight=pos_weight,
     ).to(device)
     history = {"train_loss": [], "val_auc": [], "val_acc": []}
 
