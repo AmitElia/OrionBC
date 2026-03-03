@@ -346,6 +346,305 @@ def extract_latents_predictions_by_indices(model_obj, dataset_obj, split_index_m
     return z_all, y_all, split_all, pred_all, prob_all
 
 
+def collect_latent_snapshot(model_obj, dataset_obj, split_index_map, batch_size, device):
+    z_all, y_all, split_all = extract_latents_by_indices(
+        model_obj=model_obj,
+        dataset_obj=dataset_obj,
+        split_index_map=split_index_map,
+        batch_size=batch_size,
+        device=device,
+    )
+    return {
+        "z": z_all,
+        "y": y_all.astype(int),
+        "split": split_all,
+    }
+
+
+def plot_pca3d_latent_evolution(
+    latent_snapshots,
+    class_index_to_name,
+    title,
+    split_order=("train", "val", "test"),
+):
+    if latent_snapshots is None or len(latent_snapshots) == 0:
+        print("No latent snapshots available for PCA 3D evolution.")
+        return None
+
+    try:
+        import plotly.express as px
+        import plotly.graph_objects as go
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "plotly is required for 3D latent animation. Install with: pip install plotly"
+        ) from exc
+
+    snapshots_sorted = sorted(latent_snapshots, key=lambda s: int(s.get("epoch", 0)))
+    required_keys = {"z", "y", "split"}
+    all_latents = []
+
+    for snapshot in snapshots_sorted:
+        missing = required_keys - set(snapshot.keys())
+        if missing:
+            raise ValueError(f"Latent snapshot missing required keys: {sorted(missing)}")
+        all_latents.append(np.asarray(snapshot["z"]))
+
+    z_concat = np.vstack(all_latents)
+    pca3 = PCA(n_components=3, random_state=42).fit(z_concat)
+
+    frame_rows = []
+    for fallback_idx, snapshot in enumerate(snapshots_sorted, start=1):
+        epoch = int(snapshot.get("epoch", fallback_idx))
+        z = np.asarray(snapshot["z"])
+        y = np.asarray(snapshot["y"]).astype(int).reshape(-1)
+        split = np.asarray(snapshot["split"]).astype(str).reshape(-1)
+
+        if len(z) != len(y) or len(y) != len(split):
+            raise ValueError("Each latent snapshot must align lengths for z, y, and split.")
+
+        z_pca = pca3.transform(z)
+        frame_df = pd.DataFrame(
+            {
+                "epoch": epoch,
+                "pc1": z_pca[:, 0],
+                "pc2": z_pca[:, 1],
+                "pc3": z_pca[:, 2],
+                "class_idx": y,
+                "split": split,
+            }
+        )
+        frame_rows.append(frame_df)
+
+    plot_df = pd.concat(frame_rows, ignore_index=True)
+    if plot_df.empty:
+        print("No rows available after snapshot projection.")
+        return None
+
+    plot_df["class_name"] = plot_df["class_idx"].map(
+        lambda c: class_index_to_name.get(int(c), str(int(c)))
+    )
+
+    split_order = tuple(split_order)
+    available_splits = set(plot_df["split"].astype(str).unique().tolist())
+    ordered_splits = [s for s in split_order if s in available_splits]
+    ordered_splits += sorted(available_splits - set(ordered_splits))
+    plot_df["split"] = pd.Categorical(plot_df["split"], categories=ordered_splits, ordered=True)
+
+    axis_ranges = {}
+    for col in ("pc1", "pc2", "pc3"):
+        min_v = float(plot_df[col].min())
+        max_v = float(plot_df[col].max())
+        padding = (max_v - min_v) * 0.05 if max_v > min_v else 1.0
+        axis_ranges[col] = [min_v - padding, max_v + padding]
+
+    epochs_sorted = sorted(plot_df["epoch"].astype(int).unique().tolist())
+    classes_sorted = sorted(plot_df["class_idx"].astype(int).unique().tolist())
+
+    palette = px.colors.qualitative.Plotly + px.colors.qualitative.D3 + px.colors.qualitative.Safe
+    color_map = {cls: palette[i % len(palette)] for i, cls in enumerate(classes_sorted)}
+
+    centroid_df = (
+        plot_df.groupby(["epoch", "class_idx", "class_name"], as_index=False)[["pc1", "pc2", "pc3"]]
+        .mean()
+        .sort_values(["class_idx", "epoch"])
+    )
+
+    fixed_scene = {
+        "xaxis": {"title": "PC1", "range": axis_ranges["pc1"], "autorange": False},
+        "yaxis": {"title": "PC2", "range": axis_ranges["pc2"], "autorange": False},
+        "zaxis": {"title": "PC3", "range": axis_ranges["pc3"], "autorange": False},
+        "aspectmode": "cube",
+        "camera": {"eye": {"x": 1.25, "y": 1.25, "z": 1.1}},
+    }
+
+    def _build_cloud_trace(df_cls, cls):
+        class_name = class_index_to_name.get(int(cls), str(int(cls)))
+        customdata = (
+            np.column_stack(
+                [
+                    df_cls["split"].astype(str).to_numpy(),
+                    np.full(len(df_cls), class_name),
+                    df_cls["epoch"].astype(int).to_numpy(),
+                ]
+            )
+            if len(df_cls) > 0
+            else np.empty((0, 3), dtype=object)
+        )
+        return go.Scatter3d(
+            x=df_cls["pc1"],
+            y=df_cls["pc2"],
+            z=df_cls["pc3"],
+            mode="markers",
+            name=f"{class_name} cloud",
+            legendgroup=f"class-{cls}",
+            showlegend=False,
+            marker={
+                "size": 3,
+                "opacity": 0.12,
+                "color": color_map[cls],
+            },
+            customdata=customdata,
+            hovertemplate=(
+                "Class: %{customdata[1]}<br>"
+                "Split: %{customdata[0]}<br>"
+                "Epoch: %{customdata[2]}<br>"
+                "PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>"
+            ),
+        )
+
+    def _build_centroid_trace(df_cent, cls, showlegend):
+        class_name = class_index_to_name.get(int(cls), str(int(cls)))
+        return go.Scatter3d(
+            x=df_cent["pc1"],
+            y=df_cent["pc2"],
+            z=df_cent["pc3"],
+            mode="markers",
+            name=class_name,
+            legendgroup=f"class-{cls}",
+            showlegend=showlegend,
+            marker={
+                "size": 9,
+                "opacity": 1.0,
+                "color": color_map[cls],
+                "line": {"color": "black", "width": 1},
+            },
+            hovertemplate=(
+                f"Centroid: {class_name}<br>"
+                "PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>"
+            ),
+        )
+
+    def _build_trail_trace(df_trail, cls):
+        class_name = class_index_to_name.get(int(cls), str(int(cls)))
+        return go.Scatter3d(
+            x=df_trail["pc1"],
+            y=df_trail["pc2"],
+            z=df_trail["pc3"],
+            mode="lines+markers",
+            name=f"{class_name} trail",
+            legendgroup=f"class-{cls}",
+            showlegend=False,
+            line={"color": color_map[cls], "width": 4},
+            marker={"size": 2, "color": color_map[cls], "opacity": 0.9},
+            hovertemplate=(
+                f"Trail: {class_name}<br>"
+                "PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>"
+            ),
+        )
+
+    def _build_epoch_traces(epoch, show_centroid_legend=False):
+        traces = []
+        for cls in classes_sorted:
+            cls_points = plot_df[(plot_df["epoch"] == epoch) & (plot_df["class_idx"] == cls)]
+            traces.append(_build_cloud_trace(cls_points, cls))
+
+        for cls in classes_sorted:
+            cls_cent = centroid_df[(centroid_df["epoch"] == epoch) & (centroid_df["class_idx"] == cls)]
+            traces.append(_build_centroid_trace(cls_cent, cls, showlegend=show_centroid_legend))
+
+        for cls in classes_sorted:
+            cls_trail = centroid_df[(centroid_df["epoch"] <= epoch) & (centroid_df["class_idx"] == cls)]
+            traces.append(_build_trail_trace(cls_trail, cls))
+
+        return traces
+
+    initial_epoch = epochs_sorted[0]
+    initial_traces = _build_epoch_traces(initial_epoch, show_centroid_legend=True)
+    frames = [
+        go.Frame(
+            name=str(epoch),
+            data=_build_epoch_traces(epoch, show_centroid_legend=False),
+            layout=go.Layout(scene=fixed_scene),
+        )
+        for epoch in epochs_sorted
+    ]
+
+    fig = go.Figure(data=initial_traces, frames=frames)
+    fig.update_layout(
+        title=title,
+        scene=fixed_scene,
+        uirevision="pca3d-fixed-scene",
+        legend={"title": {"text": "Class centroids"}},
+        updatemenus=[
+            {
+                "type": "buttons",
+                "showactive": False,
+                "x": 1.02,
+                "y": 1,
+                "xanchor": "left",
+                "yanchor": "top",
+                "buttons": [
+                    {
+                        "label": "Play",
+                        "method": "animate",
+                        "args": [
+                            None,
+                            {
+                                "frame": {"duration": 500, "redraw": True},
+                                "transition": {"duration": 0},
+                                "fromcurrent": True,
+                            },
+                        ],
+                    },
+                    {
+                        "label": "Pause",
+                        "method": "animate",
+                        "args": [
+                            [None],
+                            {
+                                "frame": {"duration": 0, "redraw": False},
+                                "transition": {"duration": 0},
+                                "mode": "immediate",
+                            },
+                        ],
+                    },
+                ],
+            }
+        ],
+        sliders=[
+            {
+                "active": 0,
+                "currentvalue": {"prefix": "Epoch: "},
+                "pad": {"t": 40},
+                "steps": [
+                    {
+                        "label": str(epoch),
+                        "method": "animate",
+                        "args": [
+                            [str(epoch)],
+                            {
+                                "frame": {"duration": 0, "redraw": True},
+                                "transition": {"duration": 0},
+                                "mode": "immediate",
+                            },
+                        ],
+                    }
+                    for epoch in epochs_sorted
+                ],
+            }
+        ],
+    )
+
+    for frame in fig.frames:
+        frame.layout = go.Layout(scene=fixed_scene)
+
+    fig.show()
+    return fig
+
+
+def plot_stage1_pca3d_evolution(latent_snapshots, title="Stage 1 PCA 3D latent evolution"):
+    class_map = {0: "Healthy", 1: "Cancer"}
+    return plot_pca3d_latent_evolution(latent_snapshots, class_map, title)
+
+
+def plot_stage2_pca3d_evolution(
+    latent_snapshots,
+    class_index_to_name,
+    title="Stage 2 PCA 3D latent evolution",
+):
+    return plot_pca3d_latent_evolution(latent_snapshots, class_index_to_name, title)
+
+
 def plot_stage1_latent(model_obj, dataset_obj, split_index_map, batch_size, device, title):
     z_all, y_all, split_all = extract_latents_by_indices(
         model_obj, dataset_obj, split_index_map, batch_size, device
@@ -373,7 +672,7 @@ def plot_stage1_latent(model_obj, dataset_obj, split_index_map, batch_size, devi
                         c=class_colors[cls],
                         marker=marker,
                         s=26,
-                        alpha=0.75,
+                        alpha=0.25,
                     )
 
         class_handles = [
@@ -581,32 +880,67 @@ def _plot_stage2_silhouette_by_class(z_all, y_all, class_index_to_name, title):
     plt.show()
 
 
-def _top_confused_pairs(y_true, y_pred, classes, n_pairs=6):
+def _rank_confusion_pairs(y_true, y_pred, classes, n_pairs=6, mode="most"):
     cm = confusion_matrix(y_true, y_pred, labels=classes)
+    support = cm.sum(axis=1)
     pairs = []
-    for i, cls_i in enumerate(classes):
-        for j, cls_j in enumerate(classes):
+
+    for i, cls_true in enumerate(classes):
+        for j, cls_pred in enumerate(classes):
             if i == j:
                 continue
-            count = int(cm[i, j])
-            if count > 0:
-                pairs.append((count, int(cls_i), int(cls_j)))
+            pairs.append(
+                {
+                    "count": int(cm[i, j]),
+                    "cls_true": int(cls_true),
+                    "cls_pred": int(cls_pred),
+                    "support_true": int(support[i]),
+                }
+            )
 
-    pairs.sort(reverse=True, key=lambda x: x[0])
-    return [(a, b, c) for a, b, c in pairs[:n_pairs]]
+    if mode == "most":
+        pairs.sort(
+            key=lambda item: (
+                -item["count"],
+                -item["support_true"],
+                item["cls_true"],
+                item["cls_pred"],
+            )
+        )
+    elif mode == "least":
+        pairs.sort(
+            key=lambda item: (
+                item["count"],
+                -item["support_true"],
+                item["cls_true"],
+                item["cls_pred"],
+            )
+        )
+    else:
+        raise ValueError("mode must be either 'most' or 'least'")
+
+    return [(p["count"], p["cls_true"], p["cls_pred"]) for p in pairs[:n_pairs]]
 
 
-def _plot_stage2_top_confused_pairs(umap_emb, y_all, class_index_to_name, confused_pairs, title):
-    if len(confused_pairs) == 0:
-        print("No off-diagonal confusion pairs to visualize.")
+def _top_confused_pairs(y_true, y_pred, classes, n_pairs=6):
+    return _rank_confusion_pairs(y_true, y_pred, classes, n_pairs=n_pairs, mode="most")
+
+
+def _least_confused_pairs(y_true, y_pred, classes, n_pairs=6):
+    return _rank_confusion_pairs(y_true, y_pred, classes, n_pairs=n_pairs, mode="least")
+
+
+def _plot_stage2_confusion_pairs(umap_emb, y_all, class_index_to_name, pair_rows, title, heading):
+    if len(pair_rows) == 0:
+        print("No class pairs available for confusion-based visualization.")
         return
 
     n_cols = 3
-    n_rows = int(np.ceil(len(confused_pairs) / n_cols))
+    n_rows = int(np.ceil(len(pair_rows) / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 4.5 * n_rows))
     axes = np.array(axes).reshape(-1)
 
-    for i, (count, cls_true, cls_pred) in enumerate(confused_pairs):
+    for i, (count, cls_true, cls_pred) in enumerate(pair_rows):
         ax = axes[i]
         mask = (y_all == cls_true) | (y_all == cls_pred)
 
@@ -624,12 +958,34 @@ def _plot_stage2_top_confused_pairs(umap_emb, y_all, class_index_to_name, confus
         ax.set_xlabel("UMAP-1")
         ax.set_ylabel("UMAP-2")
 
-    for j in range(len(confused_pairs), len(axes)):
+    for j in range(len(pair_rows), len(axes)):
         axes[j].axis("off")
 
-    plt.suptitle(f"{title} - Top confused class pairs", y=1.02)
+    plt.suptitle(f"{title} - {heading}", y=1.02)
     plt.tight_layout()
     plt.show()
+
+
+def _plot_stage2_top_confused_pairs(umap_emb, y_all, class_index_to_name, confused_pairs, title):
+    _plot_stage2_confusion_pairs(
+        umap_emb=umap_emb,
+        y_all=y_all,
+        class_index_to_name=class_index_to_name,
+        pair_rows=confused_pairs,
+        title=title,
+        heading="Top confused class pairs",
+    )
+
+
+def _plot_stage2_least_confused_pairs(umap_emb, y_all, class_index_to_name, least_confused_pairs, title):
+    _plot_stage2_confusion_pairs(
+        umap_emb=umap_emb,
+        y_all=y_all,
+        class_index_to_name=class_index_to_name,
+        pair_rows=least_confused_pairs,
+        title=title,
+        heading="Least-confused class pairs",
+    )
 
 
 def _top_separated_pairs(z_all, y_all, classes, n_pairs=6):
@@ -705,7 +1061,8 @@ def plot_stage2_diagnostics(
     y_prob_test,
     title,
     n_top_confused_pairs=6,
-    n_top_separated_pairs=6,
+    n_least_confused_pairs=6,
+    n_top_separated_pairs=None,
 ):
     classes = sorted(int(k) for k in class_index_to_name.keys())
 
@@ -779,12 +1136,23 @@ def plot_stage2_diagnostics(
     _plot_stage2_correctness_umap(umap_emb, y_all, pred_all, title)
     _plot_stage2_lda(z_all, y_all, class_index_to_name, title)
     _plot_stage2_centroid_distances(z_all, y_all, class_index_to_name, title)
-    _plot_stage2_silhouette_by_class(z_all, y_all, class_index_to_name, title)
 
     confused_pairs = _top_confused_pairs(y_true_test, y_pred_test, classes, n_pairs=n_top_confused_pairs)
     _plot_stage2_top_confused_pairs(umap_emb, y_all, class_index_to_name, confused_pairs, title)
 
-    separated_pairs = _top_separated_pairs(z_all, y_all, classes, n_pairs=n_top_separated_pairs)
-    _plot_stage2_top_separated_pairs(umap_emb, y_all, class_index_to_name, separated_pairs, title)
+    if n_top_separated_pairs is not None and n_least_confused_pairs == 6:
+        print(
+            "n_top_separated_pairs is deprecated and will be removed in a future version. "
+            "Using it as n_least_confused_pairs."
+        )
+        n_least_confused_pairs = n_top_separated_pairs
+
+    least_confused_pairs = _least_confused_pairs(
+        y_true_test,
+        y_pred_test,
+        classes,
+        n_pairs=n_least_confused_pairs,
+    )
+    _plot_stage2_least_confused_pairs(umap_emb, y_all, class_index_to_name, least_confused_pairs, title)
 
     return per_class_df

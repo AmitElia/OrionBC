@@ -8,6 +8,13 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+
+# configuable dataset parameters for loading and processing
+# Each dataset specifies 
+# 	file path, 
+# 	feature column name, 
+# 	columns to drop, 
+# 	and data mode (miRNA count vs log normalized data).
 DATASET_CONFIGS = {
     "tissue": {
         "path": "data/tissue_bc/GSE270497_All.txt",
@@ -23,6 +30,7 @@ DATASET_CONFIGS = {
     },
 }
 
+# Pancancer data config
 PANCANCER_MATRIX_PATH = "data/serum_pancancer/GSE211692_processed_data_matrix.txt"
 PANCANCER_METADATA_PATH = "data/serum_pancancer/GSE211692_metadata.csv"
 PANCANCER_FEATURE_COL = "ID_REF"
@@ -39,7 +47,6 @@ CIRCULATING_CANCER_SAMPLES = {
     "TM42", "TM43", "TM15", "TM16", "TM17", "TM18", "TM210", "TM211",
     "TM213", "TM214", "TM215", "TM216", "TM217", "TM218", "TM219", "TM220",
 }
-
 CIRCULATING_CONTROL_SAMPLES = {
     "TM159", "TM160", "TM161", "TM162", "TM163", "TM175", "TM176", "TM177",
     "TM178", "TM19", "TM20", "TM21", "TM22", "TM23", "TM24", "TM25",
@@ -48,7 +55,7 @@ CIRCULATING_CONTROL_SAMPLES = {
     "TM158", "TM229", "TM233", "TM331", "TM332", "TM333", "TM334", "TM335",
 }
 
-
+# Function for pancancer dataset loading and processing, including label inference and dataset summarization
 def _resolve_dataset_path(dataset_name, data_path=None):
     if data_path is not None:
         path = Path(data_path)
@@ -70,17 +77,15 @@ def _resolve_dataset_path(dataset_name, data_path=None):
 
     return path
 
-
+# Helper functions for parsing sample IDs, normalizing feature and disease names, and summarizing dataset properties
 def _numeric_sample_suffix(sample_id):
     match = re.search(r"(\d+)$", str(sample_id))
     if match is None:
         raise ValueError(f"Could not parse numeric suffix from sample '{sample_id}'")
     return int(match.group(1))
 
-
 def _normalize_feature_name(feature_name):
     return str(feature_name).strip().lower()
-
 
 def _resolve_path(path_like):
     path = Path(path_like)
@@ -91,11 +96,10 @@ def _resolve_path(path_like):
         return candidate
     return path
 
-
 def _normalize_disease_name(disease_name):
     return str(disease_name).strip().lower()
 
-
+# infer data mode (count vs normalized) based on value properties
 def infer_data_mode_from_values(values):
     values = np.asarray(values, dtype=np.float64)
     finite_mask = np.isfinite(values)
@@ -111,7 +115,7 @@ def infer_data_mode_from_values(values):
         return "count"
     return "normalized"
 
-
+# summarize dataset properties such as data mode, presence of negative values and dimensions
 def summarize_expression_matrix(counts_df, data_mode):
     values = counts_df.to_numpy(dtype=np.float64, copy=False)
     finite_mask = np.isfinite(values)
@@ -132,6 +136,11 @@ def summarize_expression_matrix(counts_df, data_mode):
 
 
 def add_serum_pancancer_stage_labels(metadata_df, disease_col=PANCANCER_DISEASE_COL):
+    """
+    Adds stage 1 binary labels and stage 2 multi-class labels to the serum pancancer metadata.
+    Stage 1: Binary classification of 'cancer' vs 'non_cancer' 
+    Stage 2: Multi-class classification of specific cancer types vs 'non_cancer'.
+    """
     if disease_col not in metadata_df.columns:
         raise ValueError(
             f"Expected disease column '{disease_col}' in metadata. "
@@ -177,6 +186,12 @@ def load_serum_pancancer_dataset(
     data_mode="normalized",
     return_info=False,
 ):
+    """
+    Loads the serum pancancer dataset, aligns metadata with the expression matrix, and adds stage 1 and stage 2 labels.
+     - Stage 1: Binary classification of 'cancer' vs 'non_cancer'
+     - Stage 2: Multi-class classification of specific cancer types vs 'non_cancer'
+     
+    """
     matrix_path = _resolve_path(matrix_path)
     metadata_path = _resolve_path(metadata_path)
 
@@ -189,6 +204,7 @@ def load_serum_pancancer_dataset(
             f"Available columns: {metadata_df.columns.tolist()}"
         )
 
+	# Ensure sample IDs are strings and check for duplicates
     metadata_df = metadata_df.copy()
     metadata_df[sample_id_col] = metadata_df[sample_id_col].astype(str)
     if metadata_df[sample_id_col].duplicated().any():
@@ -205,6 +221,7 @@ def load_serum_pancancer_dataset(
             f"Available columns (first 10): {matrix_df.columns.tolist()[:10]}"
         )
 
+	# Set feature column as index and convert values to numeric, coercing errors to NaN and filling with 0.0
     expr_df = matrix_df.set_index(feature_col)
     expr_df = expr_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
@@ -212,6 +229,7 @@ def load_serum_pancancer_dataset(
         expr_df.index = expr_df.index.map(_normalize_feature_name)
         expr_df = expr_df.groupby(level=0).mean()
 
+	# Transpose to have samples as rows and features as columns, ensuring indexes are strings for alignment
     counts_df = expr_df.T
     counts_df.index = counts_df.index.astype(str)
     counts_df.columns = counts_df.columns.astype(str)
@@ -224,6 +242,7 @@ def load_serum_pancancer_dataset(
             f"Metadata sample col='{sample_id_col}'."
         )
 
+	# Align counts_df to the order of metadata_aligned
     counts_aligned = counts_df.loc[metadata_aligned.index]
     metadata_labeled, stage2_class_to_index = add_serum_pancancer_stage_labels(
         metadata_aligned.reset_index(),
@@ -253,6 +272,9 @@ def load_serum_pancancer_stage1_binary(
     data_mode="normalized",
     return_info=False,
 ):
+    """
+    Loads the serum pancancer dataset and returns the expression matrix, stage 1 binary labels, and metadata.
+    """
     loader_output = load_serum_pancancer_dataset(
         matrix_path=matrix_path,
         metadata_path=metadata_path,
@@ -270,6 +292,11 @@ def load_serum_pancancer_stage1_binary(
 
 
 def infer_binary_labels(sample_names, dataset_name):
+    """
+    Tissue vs Circulating
+	Infers binary labels for samples based on their names and the dataset they belong to.
+    """
+
     sample_names = [str(sample).strip() for sample in sample_names]
 
     if dataset_name == "tissue":
@@ -298,6 +325,14 @@ def infer_binary_labels(sample_names, dataset_name):
 
 
 def load_expression_dataset(dataset_name, data_path=None, data_mode=None, return_info=False):
+    """
+    Loads the specified expression dataset, processes it, and infers binary labels based on sample names.
+	 - dataset_name: Name of the dataset to load (e.g., 'tissue' or 'circulating').
+	 - data_path: Optional base path to look for the dataset file. If None, uses default paths from DATASET_CONFIGS.
+	 - data_mode: Optional override for data mode ('count' or 'normalized'). If None, uses the mode specified in DATASET_CONFIGS.
+	 - return_info: If True, also returns a dictionary summarizing dataset properties.
+	 - Returns: counts_df (samples x features), labels (binary), and optionally dataset_info.
+    """
     if dataset_name not in DATASET_CONFIGS:
         raise ValueError(
             f"Unknown dataset_name='{dataset_name}'. "
@@ -338,12 +373,13 @@ def load_expression_dataset(dataset_name, data_path=None, data_mode=None, return
         return counts_df, labels, dataset_info
     return counts_df, labels
 
-
+# Aligns the feature space of the counts dataframe to a specified list of required features,
+#  filling missing features with a specified value (default 0.0).
 def align_feature_space(counts_df, required_features, fill_value=0.0):
     required_features = [_normalize_feature_name(feature) for feature in required_features]
     return counts_df.reindex(columns=required_features, fill_value=fill_value)
 
-
+# Computes the overlap between the features in the counts dataframe and a list of required features, returning lists of present and missing features.
 def get_feature_overlap(counts_df, required_features):
     available = set(counts_df.columns)
     required = [_normalize_feature_name(feature) for feature in required_features]
@@ -351,7 +387,7 @@ def get_feature_overlap(counts_df, required_features):
     missing = [feature for feature in required if feature not in available]
     return present, missing
 
-
+# Selects the top N signal features based on statistical tests (Mann-Whitney U, t-test, or PyDESeq2) comparing cancer vs healthy samples.
 def get_X_features(counts_df, labels, method="mannwhitneyu", n_features=500):
     print(f"Selecting top {n_features} signal features...")
     p_values = []
@@ -416,7 +452,8 @@ def get_X_features(counts_df, labels, method="mannwhitneyu", n_features=500):
 
     raise ValueError(f"Unknown method: {method}")
 
-
+# Selects reference features based on mean expression and coefficient of variation, 
+# prioritizing stable features among abundant genes.
 def get_reference_features(counts_df, n_features=100):
     means = counts_df.mean(axis=0)
     stds = counts_df.std(axis=0)
@@ -428,6 +465,19 @@ def get_reference_features(counts_df, n_features=100):
 
 
 class ZINBDataset(Dataset):
+    """
+    PyTorch Dataset for zero-inflated negative binomial (ZINB) modeling of expression data.
+     - counts_df: DataFrame of shape (samples x features) containing expression counts.
+     - labels: Array-like of shape (samples,) containing binary or multi-class labels for each sample.
+     - signal_features: List of feature names to use as input signals (X).
+     - ref_features: List of feature names to use as reference features (R).
+     - task_type: String indicating the type of classification task ('binary' or 'multiclass').
+	 - The dataset returns tuples of (X, R, library_size, label) for each sample, where:
+	   - X: Tensor of shape (num_signal_features,) containing the signal features for the sample
+	   - R: Tensor of shape (num_ref_features,) containing the reference features for the sample
+	   - library_size: Tensor of shape (1,) containing the total count (library size)
+	   - label: Tensor containing the binary or multi-class label for the sample
+    """
     def __init__(self, counts_df, labels, signal_features, ref_features, task_type="binary"):
         labels = np.asarray(labels).reshape(-1)
         if len(labels) != len(counts_df):

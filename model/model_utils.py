@@ -251,6 +251,9 @@ def train_orion(
     recon_mode="zinb",
     class_weights=None,
     pos_weight=None,
+    snapshot_fn=None,
+    snapshot_every=5,
+    snapshot_include_first_last=True,
 ):
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -263,10 +266,47 @@ def train_orion(
         class_weights=class_weights,
         pos_weight=pos_weight,
     ).to(device)
-    history = {"train_loss": [], "val_auc": [], "val_acc": []}
+    history = {"train_loss": [], "val_auc": [], "val_acc": [], "latent_snapshots": []}
+    captured_snapshot_epochs = set()
+
+    if snapshot_fn is not None:
+        if snapshot_every is None:
+            snapshot_every = 5
+        snapshot_every = int(snapshot_every)
+        if snapshot_every <= 0:
+            raise ValueError("snapshot_every must be a positive integer")
+
+    def _capture_snapshot(epoch_number):
+        if snapshot_fn is None or epoch_number in captured_snapshot_epochs:
+            return
+
+        snapshot = snapshot_fn(model)
+        if not isinstance(snapshot, dict):
+            raise TypeError("snapshot_fn must return a dict with latent snapshot fields")
+        snapshot_with_epoch = dict(snapshot)
+        snapshot_with_epoch["epoch"] = int(epoch_number)
+        history["latent_snapshots"].append(snapshot_with_epoch)
+        captured_snapshot_epochs.add(epoch_number)
+
+    def _should_capture_snapshot(epoch_number, total_epochs):
+        if snapshot_fn is None:
+            return False
+
+        # In-place snapshot schedule:
+        #  - always epochs 1..10
+        #  - every `snapshot_every` epochs afterwards
+        #  - final epoch (optional explicit include)
+        capture = (epoch_number <= 10) or ((epoch_number % snapshot_every) == 0)
+        if snapshot_include_first_last and epoch_number == total_epochs:
+            capture = True
+        return capture
+
+    # Capture epoch 0 (pre-training) when snapshots are enabled.
+    _capture_snapshot(0)
 
     print(f"Starting training on {device} for {epochs} epochs (recon_mode={recon_mode})...")
     for epoch in range(epochs):
+        epoch_number = epoch + 1
         model.train()
         epoch_loss = 0.0
 
@@ -299,16 +339,19 @@ def train_orion(
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
         history["train_loss"].append(avg_train_loss)
 
-        if (epoch + 1) % 5 == 0:
+        if epoch_number % 5 == 0:
             val_auc, val_acc = evaluate_model(model, val_loader, device)
             history["val_auc"].append(val_auc)
             history["val_acc"].append(val_acc)
             print(
-                f"Epoch {epoch + 1:03d} | "
+                f"Epoch {epoch_number:03d} | "
                 f"Loss: {avg_train_loss:.4f} | "
                 f"Val AUC: {val_auc:.4f} | "
                 f"Val Acc: {val_acc:.4f}"
             )
+
+        if _should_capture_snapshot(epoch_number, epochs):
+            _capture_snapshot(epoch_number)
 
     return history
 
