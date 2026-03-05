@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import numpy as np
 import pandas as pd
 import torch
@@ -304,6 +305,26 @@ def extract_latents_by_indices(model_obj, dataset_obj, split_index_map, batch_si
     return z_all, y_all, split_all
 
 
+def _extract_latents_from_state(
+    model_obj,
+    state_dict,
+    dataset_obj,
+    split_index_map,
+    batch_size,
+    device,
+):
+    model_copy = copy.deepcopy(model_obj)
+    model_copy.load_state_dict(copy.deepcopy(state_dict))
+    model_copy.to(device)
+    return extract_latents_by_indices(
+        model_copy,
+        dataset_obj,
+        split_index_map,
+        batch_size,
+        device,
+    )
+
+
 def extract_latents_predictions_by_indices(model_obj, dataset_obj, split_index_map, batch_size, device):
     model_obj.eval()
     multiclass = int(getattr(model_obj, "n_classes", 1)) > 1
@@ -344,6 +365,121 @@ def extract_latents_predictions_by_indices(model_obj, dataset_obj, split_index_m
         prob_all = np.concatenate(all_prob, axis=0)
 
     return z_all, y_all, split_all, pred_all, prob_all
+
+
+def _scatter_binary_projection(ax, emb, y_all, split_all, title):
+    class_colors = {0: "royalblue", 1: "crimson"}
+    class_labels = {0: "Non-cancer", 1: "Cancer"}
+    split_markers = {"train": "o", "val": "^", "test": "X"}
+
+    for cls in [0, 1]:
+        for split_name, marker in split_markers.items():
+            idx = (y_all == cls) & (split_all == split_name)
+            if np.any(idx):
+                ax.scatter(
+                    emb[idx, 0],
+                    emb[idx, 1],
+                    c=class_colors[cls],
+                    marker=marker,
+                    s=26,
+                    alpha=0.75,
+                )
+
+    class_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=class_colors[1],
+            label=class_labels[1],
+            markersize=8,
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=class_colors[0],
+            label=class_labels[0],
+            markersize=8,
+        ),
+    ]
+    split_handles = [
+        Line2D([0], [0], marker="o", color="black", linestyle="None", label="Train", markersize=7),
+        Line2D([0], [0], marker="^", color="black", linestyle="None", label="Val", markersize=7),
+        Line2D([0], [0], marker="X", color="black", linestyle="None", label="Test", markersize=7),
+    ]
+
+    leg1 = ax.legend(handles=class_handles, loc="upper right", title="Class")
+    ax.add_artist(leg1)
+    ax.legend(handles=split_handles, loc="lower right", title="Split")
+    ax.set_title(title)
+    ax.set_xlabel("PCA-1")
+    ax.set_ylabel("PCA-2")
+
+
+def plot_binary_epoch_pca_comparison(
+    model_obj,
+    initial_state_dict,
+    dataset_obj,
+    split_index_map,
+    batch_size,
+    device,
+    title,
+):
+    z_init, y_init, split_init = _extract_latents_from_state(
+        model_obj=model_obj,
+        state_dict=initial_state_dict,
+        dataset_obj=dataset_obj,
+        split_index_map=split_index_map,
+        batch_size=batch_size,
+        device=device,
+    )
+    z_last, y_last, split_last = extract_latents_by_indices(
+        model_obj=model_obj,
+        dataset_obj=dataset_obj,
+        split_index_map=split_index_map,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    y_init = y_init.astype(int)
+    y_last = y_last.astype(int)
+
+    shared_pca = PCA(n_components=2, random_state=42).fit(np.vstack([z_init, z_last]))
+    emb_init = shared_pca.transform(z_init)
+    emb_last = shared_pca.transform(z_last)
+
+    x_min = float(min(emb_init[:, 0].min(), emb_last[:, 0].min()))
+    x_max = float(max(emb_init[:, 0].max(), emb_last[:, 0].max()))
+    y_min = float(min(emb_init[:, 1].min(), emb_last[:, 1].min()))
+    y_max = float(max(emb_init[:, 1].max(), emb_last[:, 1].max()))
+    x_pad = max((x_max - x_min) * 0.05, 1e-6)
+    y_pad = max((y_max - y_min) * 0.05, 1e-6)
+    xlim = (x_min - x_pad, x_max + x_pad)
+    ylim = (y_min - y_pad, y_max + y_pad)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    _scatter_binary_projection(
+        axes[0],
+        emb_init,
+        y_init,
+        split_init,
+        f"{title} - PCA @ Epoch 0 (random init)",
+    )
+    _scatter_binary_projection(
+        axes[1],
+        emb_last,
+        y_last,
+        split_last,
+        f"{title} - PCA @ Last Epoch",
+    )
+    for ax in axes:
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_stage1_latent(model_obj, dataset_obj, split_index_map, batch_size, device, title):
@@ -446,87 +582,79 @@ def build_stage2_per_class_metrics(y_true, y_pred, y_prob, class_index_to_name):
     return pd.DataFrame(rows)
 
 
-def _plot_stage2_trueclass_umap(umap_emb, y_all, class_index_to_name, title):
-    classes = sorted(np.unique(y_all).tolist())
+def _build_stage2_class_color_map(classes):
     palette = plt.cm.get_cmap("tab20", max(len(classes), 13))
-
-    plt.figure(figsize=(10, 7))
-    for i, cls in enumerate(classes):
-        idx = y_all == cls
-        plt.scatter(
-            umap_emb[idx, 0],
-            umap_emb[idx, 1],
-            s=16,
-            alpha=0.75,
-            color=palette(i),
-            label=class_index_to_name[int(cls)],
-        )
-
-    plt.title(f"{title} - UMAP by true class")
-    plt.xlabel("UMAP-1")
-    plt.ylabel("UMAP-2")
-    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
-    plt.tight_layout()
-    plt.show()
+    return {int(cls): palette(i) for i, cls in enumerate(classes)}
 
 
-def _plot_stage2_correctness_umap(umap_emb, y_all, pred_all, title):
-    correct = pred_all == y_all
+def _fit_stage2_projection(z_all, y_all, method="lda_fallback"):
+    method = str(method).strip().lower()
+    if method in {"lda_fallback", "lda"}:
+        try:
+            lda = LinearDiscriminantAnalysis(n_components=2)
+            emb = lda.fit_transform(z_all, y_all)
+            return emb, "LDA"
+        except Exception:
+            if method == "lda":
+                raise
+            emb = PCA(n_components=2, random_state=42).fit_transform(z_all)
+            return emb, "PCA fallback"
 
-    plt.figure(figsize=(9, 7))
-    plt.scatter(
-        umap_emb[correct, 0],
-        umap_emb[correct, 1],
-        s=16,
-        alpha=0.35,
-        color="seagreen",
-        label="Correct",
-    )
-    plt.scatter(
-        umap_emb[~correct, 0],
-        umap_emb[~correct, 1],
-        s=28,
-        alpha=0.9,
-        color="crimson",
-        marker="x",
-        label="Incorrect",
-    )
-    plt.title(f"{title} - UMAP prediction correctness")
-    plt.xlabel("UMAP-1")
-    plt.ylabel("UMAP-2")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-
-def _plot_stage2_lda(z_all, y_all, class_index_to_name, title):
-    classes = sorted(np.unique(y_all).tolist())
-
-    try:
-        lda = LinearDiscriminantAnalysis(n_components=2)
-        emb = lda.fit_transform(z_all, y_all)
-        emb_title = "LDA"
-    except Exception:
+    if method == "pca":
         emb = PCA(n_components=2, random_state=42).fit_transform(z_all)
-        emb_title = "PCA fallback"
+        return emb, "PCA"
 
-    palette = plt.cm.get_cmap("tab20", max(len(classes), 13))
+    raise ValueError("projection_method must be one of {'lda_fallback', 'lda', 'pca'}")
+
+
+def _plot_stage2_trueclass_projection(emb, y_all, class_index_to_name, class_color_map, title, projection_label):
+    classes = sorted(np.unique(y_all).tolist())
+
     plt.figure(figsize=(10, 7))
-    for i, cls in enumerate(classes):
+    for cls in classes:
         idx = y_all == cls
         plt.scatter(
             emb[idx, 0],
             emb[idx, 1],
             s=16,
             alpha=0.75,
-            color=palette(i),
+            color=class_color_map[int(cls)],
             label=class_index_to_name[int(cls)],
         )
 
-    plt.title(f"{title} - {emb_title} by true class")
-    plt.xlabel(f"{emb_title}-1")
-    plt.ylabel(f"{emb_title}-2")
+    plt.title(f"{title} - {projection_label} by true class")
+    plt.xlabel(f"{projection_label}-1")
+    plt.ylabel(f"{projection_label}-2")
     plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+
+def _plot_stage2_correctness_projection(emb, y_all, pred_all, title, projection_label):
+    correct = pred_all == y_all
+
+    plt.figure(figsize=(9, 7))
+    plt.scatter(
+        emb[correct, 0],
+        emb[correct, 1],
+        s=16,
+        alpha=0.35,
+        color="seagreen",
+        label="Correct",
+    )
+    plt.scatter(
+        emb[~correct, 0],
+        emb[~correct, 1],
+        s=28,
+        alpha=0.9,
+        color="crimson",
+        marker="x",
+        label="Incorrect",
+    )
+    plt.title(f"{title} - {projection_label} prediction correctness")
+    plt.xlabel(f"{projection_label}-1")
+    plt.ylabel(f"{projection_label}-2")
+    plt.legend()
     plt.tight_layout()
     plt.show()
 
@@ -537,6 +665,7 @@ def _plot_stage2_centroid_distances(z_all, y_all, class_index_to_name, title):
 
     centroids = np.vstack([z_all[y_all == c].mean(axis=0) for c in classes])
     dist = cdist(centroids, centroids, metric="euclidean")
+    cmap_name = "mako" if sns is not None else "viridis"
 
     plt.figure(figsize=(11, 9))
     _heatmap(
@@ -546,7 +675,7 @@ def _plot_stage2_centroid_distances(z_all, y_all, class_index_to_name, title):
         title=f"{title} - Latent centroid distance heatmap",
         cbar_label="Euclidean distance",
         annot=False,
-        cmap="mako",
+        cmap=cmap_name,
     )
     plt.xticks(rotation=45, ha="right")
     plt.yticks(rotation=0)
@@ -596,10 +725,27 @@ def _top_confused_pairs(y_true, y_pred, classes, n_pairs=6):
     return [(a, b, c) for a, b, c in pairs[:n_pairs]]
 
 
-def _plot_stage2_top_confused_pairs(umap_emb, y_all, class_index_to_name, confused_pairs, title):
+def _plot_stage2_top_confused_pairs(
+    emb,
+    y_all,
+    split_all,
+    class_index_to_name,
+    class_color_map,
+    confused_pairs,
+    title,
+    projection_label,
+    pair_point_scope,
+):
     if len(confused_pairs) == 0:
         print("No off-diagonal confusion pairs to visualize.")
         return
+
+    if pair_point_scope == "test":
+        scope_mask = split_all == "test"
+    elif pair_point_scope == "all":
+        scope_mask = np.ones_like(y_all, dtype=bool)
+    else:
+        raise ValueError("pair_point_scope must be one of {'test', 'all'}")
 
     n_cols = 3
     n_rows = int(np.ceil(len(confused_pairs) / n_cols))
@@ -608,21 +754,26 @@ def _plot_stage2_top_confused_pairs(umap_emb, y_all, class_index_to_name, confus
 
     for i, (count, cls_true, cls_pred) in enumerate(confused_pairs):
         ax = axes[i]
-        mask = (y_all == cls_true) | (y_all == cls_pred)
+        mask = scope_mask & ((y_all == cls_true) | (y_all == cls_pred))
 
-        ax.scatter(
-            umap_emb[mask, 0],
-            umap_emb[mask, 1],
-            c=np.where(y_all[mask] == cls_true, "royalblue", "darkorange"),
-            s=18,
-            alpha=0.75,
-        )
+        for cls in [cls_true, cls_pred]:
+            cls_mask = mask & (y_all == cls)
+            if np.any(cls_mask):
+                ax.scatter(
+                    emb[cls_mask, 0],
+                    emb[cls_mask, 1],
+                    color=class_color_map[int(cls)],
+                    s=18,
+                    alpha=0.75,
+                    label=class_index_to_name[int(cls)],
+                )
         ax.set_title(
             f"{class_index_to_name[cls_true]} vs {class_index_to_name[cls_pred]}\n"
             f"test confusions: {count}"
         )
-        ax.set_xlabel("UMAP-1")
-        ax.set_ylabel("UMAP-2")
+        ax.set_xlabel(f"{projection_label}-1")
+        ax.set_ylabel(f"{projection_label}-2")
+        ax.legend(loc="best", fontsize=8, frameon=False)
 
     for j in range(len(confused_pairs), len(axes)):
         axes[j].axis("off")
@@ -657,10 +808,27 @@ def _top_separated_pairs(z_all, y_all, classes, n_pairs=6):
     return pairs[:n_pairs]
 
 
-def _plot_stage2_top_separated_pairs(umap_emb, y_all, class_index_to_name, separated_pairs, title):
+def _plot_stage2_top_separated_pairs(
+    emb,
+    y_all,
+    split_all,
+    class_index_to_name,
+    class_color_map,
+    separated_pairs,
+    title,
+    projection_label,
+    pair_point_scope,
+):
     if len(separated_pairs) == 0:
         print("No class pairs available for separation visualization.")
         return
+
+    if pair_point_scope == "test":
+        scope_mask = split_all == "test"
+    elif pair_point_scope == "all":
+        scope_mask = np.ones_like(y_all, dtype=bool)
+    else:
+        raise ValueError("pair_point_scope must be one of {'test', 'all'}")
 
     n_cols = 3
     n_rows = int(np.ceil(len(separated_pairs) / n_cols))
@@ -669,21 +837,26 @@ def _plot_stage2_top_separated_pairs(umap_emb, y_all, class_index_to_name, separ
 
     for i, (dist_value, cls_a, cls_b) in enumerate(separated_pairs):
         ax = axes[i]
-        mask = (y_all == cls_a) | (y_all == cls_b)
+        mask = scope_mask & ((y_all == cls_a) | (y_all == cls_b))
 
-        ax.scatter(
-            umap_emb[mask, 0],
-            umap_emb[mask, 1],
-            c=np.where(y_all[mask] == cls_a, "royalblue", "darkorange"),
-            s=18,
-            alpha=0.75,
-        )
+        for cls in [cls_a, cls_b]:
+            cls_mask = mask & (y_all == cls)
+            if np.any(cls_mask):
+                ax.scatter(
+                    emb[cls_mask, 0],
+                    emb[cls_mask, 1],
+                    color=class_color_map[int(cls)],
+                    s=18,
+                    alpha=0.75,
+                    label=class_index_to_name[int(cls)],
+                )
         ax.set_title(
             f"{class_index_to_name[cls_a]} vs {class_index_to_name[cls_b]}\n"
             f"latent centroid dist: {dist_value:.3f}"
         )
-        ax.set_xlabel("UMAP-1")
-        ax.set_ylabel("UMAP-2")
+        ax.set_xlabel(f"{projection_label}-1")
+        ax.set_ylabel(f"{projection_label}-2")
+        ax.legend(loc="best", fontsize=8, frameon=False)
 
     for j in range(len(separated_pairs), len(axes)):
         axes[j].axis("off")
@@ -706,10 +879,12 @@ def plot_stage2_diagnostics(
     title,
     n_top_confused_pairs=6,
     n_top_separated_pairs=6,
+    projection_method="lda_fallback",
+    pair_point_scope="test",
 ):
     classes = sorted(int(k) for k in class_index_to_name.keys())
 
-    z_all, y_all, _, pred_all, _ = extract_latents_predictions_by_indices(
+    z_all, y_all, split_all, pred_all, _ = extract_latents_predictions_by_indices(
         model_obj,
         dataset_obj,
         split_index_map,
@@ -717,7 +892,8 @@ def plot_stage2_diagnostics(
         device,
     )
 
-    umap_emb, _ = _fit_umap_embedding(z_all, n_neighbors=20, min_dist=0.15, random_state=42)
+    emb_all, emb_label = _fit_stage2_projection(z_all, y_all, method=projection_method)
+    class_color_map = _build_stage2_class_color_map(classes)
 
     per_class_df = build_stage2_per_class_metrics(
         y_true=y_true_test,
@@ -775,16 +951,49 @@ def plot_stage2_diagnostics(
     plt.tight_layout()
     plt.show()
 
-    _plot_stage2_trueclass_umap(umap_emb, y_all, class_index_to_name, title)
-    _plot_stage2_correctness_umap(umap_emb, y_all, pred_all, title)
-    _plot_stage2_lda(z_all, y_all, class_index_to_name, title)
+    _plot_stage2_trueclass_projection(
+        emb_all,
+        y_all,
+        class_index_to_name,
+        class_color_map,
+        title,
+        emb_label,
+    )
+    _plot_stage2_correctness_projection(emb_all, y_all, pred_all, title, emb_label)
     _plot_stage2_centroid_distances(z_all, y_all, class_index_to_name, title)
     _plot_stage2_silhouette_by_class(z_all, y_all, class_index_to_name, title)
 
     confused_pairs = _top_confused_pairs(y_true_test, y_pred_test, classes, n_pairs=n_top_confused_pairs)
-    _plot_stage2_top_confused_pairs(umap_emb, y_all, class_index_to_name, confused_pairs, title)
+    _plot_stage2_top_confused_pairs(
+        emb_all,
+        y_all,
+        split_all,
+        class_index_to_name,
+        class_color_map,
+        confused_pairs,
+        title,
+        emb_label,
+        pair_point_scope,
+    )
 
-    separated_pairs = _top_separated_pairs(z_all, y_all, classes, n_pairs=n_top_separated_pairs)
-    _plot_stage2_top_separated_pairs(umap_emb, y_all, class_index_to_name, separated_pairs, title)
+    if pair_point_scope == "test":
+        sep_mask = split_all == "test"
+    elif pair_point_scope == "all":
+        sep_mask = np.ones_like(y_all, dtype=bool)
+    else:
+        raise ValueError("pair_point_scope must be one of {'test', 'all'}")
+
+    separated_pairs = _top_separated_pairs(z_all[sep_mask], y_all[sep_mask], classes, n_pairs=n_top_separated_pairs)
+    _plot_stage2_top_separated_pairs(
+        emb_all,
+        y_all,
+        split_all,
+        class_index_to_name,
+        class_color_map,
+        separated_pairs,
+        title,
+        emb_label,
+        pair_point_scope,
+    )
 
     return per_class_df
